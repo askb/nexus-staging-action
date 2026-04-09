@@ -1,0 +1,310 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+
+# nexus-staging-action
+name: '🚀 Nexus Staging'
+description: 'Manage Sonatype Nexus staging repository lifecycle'
+author: 'Anil Belur <askb23@gmail.com>'
+
+inputs:
+  nexus-server:
+    description: 'Nexus server URL (e.g., https://nexus.opendaylight.org)'
+    required: true
+  nexus-username:
+    description: 'Nexus username for authentication'
+    required: true
+  nexus-password:
+    description: 'Nexus password for authentication'
+    required: true
+  staging-profile-id:
+    description: 'Nexus staging profile ID (per-project)'
+    required: true
+  mode:
+    description: 'Operation mode: stage, close, promote, drop'
+    required: true
+    default: 'stage'
+  m2repo-path:
+    description: 'Path to local Maven repo directory (for stage mode)'
+    required: false
+    default: 'm2repo'
+  staging-repo-id:
+    description: 'Existing staging repo ID (for close/promote/drop modes)'
+    required: false
+    default: ''
+  description:
+    description: 'Description for the staging repository'
+    required: false
+    default: 'GitHub Actions staging'
+
+outputs:
+  staging-repo-id:
+    description: 'Staging repository ID'
+    value: ${{ steps.nexus.outputs.staging-repo-id }}
+  staging-repo-url:
+    description: 'Staging repository URL'
+    value: ${{ steps.nexus.outputs.staging-repo-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Validate inputs'
+      shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_M2REPO_PATH: ${{ inputs.m2repo-path }}
+        INPUT_STAGING_REPO_ID: ${{ inputs.staging-repo-id }}
+      run: |
+        # SPDX-License-Identifier: Apache-2.0
+        set -euo pipefail
+
+        echo "---> nexus-staging: Validating inputs"
+
+        case "$INPUT_MODE" in
+          stage|close|promote|drop)
+            ;;
+          *)
+            echo "::error::Invalid mode: $INPUT_MODE" \
+              "(must be: stage, close, promote, drop)"
+            exit 1
+            ;;
+        esac
+
+        if [ "$INPUT_MODE" = "stage" ]; then
+          if [ ! -d "$INPUT_M2REPO_PATH" ]; then
+            echo "::error::m2repo-path directory not found: $INPUT_M2REPO_PATH"
+            exit 1
+          fi
+          FILE_COUNT=$(find "$INPUT_M2REPO_PATH" -type f | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "::error::m2repo-path is empty: $INPUT_M2REPO_PATH"
+            exit 1
+          fi
+          echo "INFO: Found $FILE_COUNT files in $INPUT_M2REPO_PATH"
+        fi
+
+        if [ "$INPUT_MODE" != "stage" ] && [ -z "$INPUT_STAGING_REPO_ID" ]; then
+          echo "::error::staging-repo-id is required for mode: $INPUT_MODE"
+          exit 1
+        fi
+
+    - name: 'Execute Nexus staging operation'
+      id: nexus
+      shell: bash
+      env:
+        INPUT_NEXUS_SERVER: ${{ inputs.nexus-server }}
+        INPUT_NEXUS_USERNAME: ${{ inputs.nexus-username }}
+        INPUT_NEXUS_PASSWORD: ${{ inputs.nexus-password }}
+        INPUT_STAGING_PROFILE_ID: ${{ inputs.staging-profile-id }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_M2REPO_PATH: ${{ inputs.m2repo-path }}
+        INPUT_STAGING_REPO_ID: ${{ inputs.staging-repo-id }}
+        INPUT_DESCRIPTION: ${{ inputs.description }}
+      run: |
+        # SPDX-License-Identifier: Apache-2.0
+        set -euo pipefail
+
+        echo "---> nexus-staging: mode=$INPUT_MODE"
+
+        # Mask credentials
+        echo "::add-mask::${INPUT_NEXUS_PASSWORD}"
+
+        NEXUS_SERVER="${INPUT_NEXUS_SERVER%/}"
+        AUTH="${INPUT_NEXUS_USERNAME}:${INPUT_NEXUS_PASSWORD}"
+        PROFILE_ID="${INPUT_STAGING_PROFILE_ID}"
+        STAGING_API="${NEXUS_SERVER}/service/local/staging"
+
+        # ─── STAGE MODE ────────────────────────────────────────
+        if [ "$INPUT_MODE" = "stage" ]; then
+            echo "INFO: Creating staging repository..."
+
+            # Step 1: Create staging repo
+            XML_DATA="<promoteRequest><data>"
+            XML_DATA+="<description>"
+            XML_DATA+="${INPUT_DESCRIPTION}"
+            XML_DATA+="</description>"
+            XML_DATA+="</data></promoteRequest>"
+            CREATE_RESPONSE=$(curl -sf -u "$AUTH" \
+                -H "Content-Type: application/xml" \
+                -H "Accept: application/xml" \
+                -d "$XML_DATA" \
+                "${STAGING_API}/profiles/${PROFILE_ID}/start")
+
+            REPO_ID=$(echo "$CREATE_RESPONSE" \
+                | grep -oP \
+                '<stagedRepositoryId>\K[^<]+' \
+                || echo "$CREATE_RESPONSE" \
+                | sed -n \
+                's/.*<stagedRepositoryId>\(.*\)<\/stagedRepositoryId>.*/\1/p')
+
+            if [ -z "$REPO_ID" ]; then
+                echo "::error::Failed to create staging repository"
+                echo "Response: $CREATE_RESPONSE"
+                exit 1
+            fi
+            echo "INFO: Staging repository ${REPO_ID} created"
+
+            # Step 2: Upload artifacts
+            DEPLOY_URL="${NEXUS_SERVER}/service/local/staging"
+            DEPLOY_URL+="/deployByRepositoryId/${REPO_ID}"
+            UPLOAD_COUNT=0
+            UPLOAD_FAIL=0
+
+            while IFS= read -r -d '' file; do
+                rel_path="${file#${INPUT_M2REPO_PATH}/}"
+                if curl -sf -u "$AUTH" \
+                    --upload-file "$file" \
+                    "${DEPLOY_URL}/${rel_path}"; then
+                    UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
+                else
+                    echo "::warning::Failed to upload: $rel_path"
+                    UPLOAD_FAIL=$((UPLOAD_FAIL + 1))
+                fi
+            done < <(find "$INPUT_M2REPO_PATH" -type f -print0)
+
+            echo "INFO: Uploaded ${UPLOAD_COUNT} files" \
+                "(${UPLOAD_FAIL} failures)"
+
+            if [ "$UPLOAD_FAIL" -gt 0 ] && [ "$UPLOAD_COUNT" -eq 0 ]; then
+                echo "::error::All uploads failed"
+                exit 1
+            fi
+
+            # Step 3: Close staging repo
+            echo "INFO: Closing staging repository" \
+                "${REPO_ID}..."
+            CLOSE_XML="<promoteRequest><data>"
+            CLOSE_XML+="<stagedRepositoryId>"
+            CLOSE_XML+="${REPO_ID}"
+            CLOSE_XML+="</stagedRepositoryId>"
+            CLOSE_XML+="<description>"
+            CLOSE_XML+="Close: ${INPUT_DESCRIPTION}"
+            CLOSE_XML+="</description>"
+            CLOSE_XML+="</data></promoteRequest>"
+            curl -sf -u "$AUTH" \
+                -H "Content-Type: application/xml" \
+                -d "$CLOSE_XML" \
+                "${STAGING_API}/profiles/${PROFILE_ID}/finish"
+
+            echo "INFO: Staging repository ${REPO_ID} closed"
+
+            REPO_URL="${NEXUS_SERVER}/content/repositories/${REPO_ID}"
+
+            # Write staging-repo.txt (same format as JJB)
+            mkdir -p "${GITHUB_WORKSPACE}/archives"
+            echo "${REPO_ID} ${REPO_URL}" \
+                | tee -a "${GITHUB_WORKSPACE}/archives/staging-repo.txt"
+
+            # Set outputs
+            echo "staging-repo-id=${REPO_ID}" >> "$GITHUB_OUTPUT"
+            echo "staging-repo-url=${REPO_URL}" >> "$GITHUB_OUTPUT"
+
+            # Summary
+            {
+                echo "## Nexus Staging Complete ✅"
+                echo ""
+                echo "| | |"
+                echo "|---|---|"
+                echo "| **Mode** | stage |"
+                echo "| **Repo ID** | \`${REPO_ID}\` |"
+                echo "| **Repo URL** | ${REPO_URL} |"
+                echo "| **Files Uploaded** | ${UPLOAD_COUNT} |"
+                echo "| **Upload Failures** | ${UPLOAD_FAIL} |"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+        # ─── PROMOTE MODE ──────────────────────────────────────
+        elif [ "$INPUT_MODE" = "promote" ]; then
+            echo "INFO: Promoting staging repository" \
+                "${INPUT_STAGING_REPO_ID}..."
+
+            # Verify staging repository exists
+            echo "INFO: Verifying staging repository..."
+            curl -sf -u "$AUTH" \
+                -H "Accept: application/xml" \
+                "${STAGING_API}/repository/${INPUT_STAGING_REPO_ID}" > /dev/null
+
+            # Promote
+            PROMO_XML="<promoteRequest><data>"
+            PROMO_XML+="<stagedRepositoryId>"
+            PROMO_XML+="${INPUT_STAGING_REPO_ID}"
+            PROMO_XML+="</stagedRepositoryId>"
+            PROMO_XML+="<description>"
+            PROMO_XML+="Promote: ${INPUT_DESCRIPTION}"
+            PROMO_XML+="</description>"
+            PROMO_XML+="</data></promoteRequest>"
+            curl -sf -u "$AUTH" \
+                -H "Content-Type: application/xml" \
+                -d "$PROMO_XML" \
+                "${STAGING_API}/profiles/${PROFILE_ID}/promote"
+
+            echo "INFO: Staging repository" \
+                "${INPUT_STAGING_REPO_ID} promoted"
+
+            REPO_URL="${NEXUS_SERVER}/content/repositories"
+            REPO_URL+="/${INPUT_STAGING_REPO_ID}"
+            echo "staging-repo-id=${INPUT_STAGING_REPO_ID}" \
+                >> "$GITHUB_OUTPUT"
+            echo "staging-repo-url=${REPO_URL}" \
+                >> "$GITHUB_OUTPUT"
+
+            {
+                echo "## Nexus Staging Promoted ✅"
+                echo ""
+                echo "| | |"
+                echo "|---|---|"
+                echo "| **Mode** | promote |"
+                echo "| **Repo ID** | \`${INPUT_STAGING_REPO_ID}\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+        # ─── CLOSE MODE ────────────────────────────────────
+        elif [ "$INPUT_MODE" = "close" ]; then
+            echo "INFO: Closing staging repository" \
+                "${INPUT_STAGING_REPO_ID}..."
+
+            CLOSE_XML="<promoteRequest><data>"
+            CLOSE_XML+="<stagedRepositoryId>"
+            CLOSE_XML+="${INPUT_STAGING_REPO_ID}"
+            CLOSE_XML+="</stagedRepositoryId>"
+            CLOSE_XML+="<description>"
+            CLOSE_XML+="Close: ${INPUT_DESCRIPTION}"
+            CLOSE_XML+="</description>"
+            CLOSE_XML+="</data></promoteRequest>"
+            curl -sf -u "$AUTH" \
+                -H "Content-Type: application/xml" \
+                -d "$CLOSE_XML" \
+                "${STAGING_API}/profiles/${PROFILE_ID}/finish"
+
+            echo "INFO: Staging repository" \
+                "${INPUT_STAGING_REPO_ID} closed"
+
+            REPO_URL="${NEXUS_SERVER}/content/repositories"
+            REPO_URL+="/${INPUT_STAGING_REPO_ID}"
+            echo "staging-repo-id=${INPUT_STAGING_REPO_ID}" \
+                >> "$GITHUB_OUTPUT"
+            echo "staging-repo-url=${REPO_URL}" \
+                >> "$GITHUB_OUTPUT"
+
+        # ─── DROP MODE ─────────────────────────────────────
+        elif [ "$INPUT_MODE" = "drop" ]; then
+            echo "INFO: Dropping staging repository" \
+                "${INPUT_STAGING_REPO_ID}..."
+
+            DROP_XML="<promoteRequest><data>"
+            DROP_XML+="<stagedRepositoryId>"
+            DROP_XML+="${INPUT_STAGING_REPO_ID}"
+            DROP_XML+="</stagedRepositoryId>"
+            DROP_XML+="<description>"
+            DROP_XML+="Drop: ${INPUT_DESCRIPTION}"
+            DROP_XML+="</description>"
+            DROP_XML+="</data></promoteRequest>"
+            curl -sf -u "$AUTH" \
+                -H "Content-Type: application/xml" \
+                -d "$DROP_XML" \
+                "${STAGING_API}/profiles/${PROFILE_ID}/drop"
+
+            echo "INFO: Staging repository" \
+                "${INPUT_STAGING_REPO_ID} dropped"
+            echo "staging-repo-id=${INPUT_STAGING_REPO_ID}" \
+                >> "$GITHUB_OUTPUT"
+            echo "staging-repo-url=" >> "$GITHUB_OUTPUT"
+        fi

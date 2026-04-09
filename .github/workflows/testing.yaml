@@ -1,0 +1,202 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+
+# Action test/validation workflow
+name: 'Test GitHub Action 🧪'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+  push:
+    branches: ['main']
+  pull_request:
+    branches: ['main']
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+# Integration tests require a Nexus 2 server with staging profiles
+# and corresponding credentials stored as repository secrets:
+# NEXUS_SERVER = 'https://nexus.example.org'
+# NEXUS_USERNAME -> Nexus service account username
+# NEXUS_PASSWORD -> Nexus service account password
+# STAGING_PROFILE_ID -> Nexus staging profile ID
+
+jobs:
+  ### Test input validation ###
+  test-invalid-mode:
+    name: 'Test: Invalid mode fails'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 3
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@fe104658747b27e96e4f7e80cd0a94068e53901d  # v2.16.1
+        with:
+          egress-policy: 'audit'
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: 'Run action with invalid mode (expect failure)'
+        id: invalid-mode
+        continue-on-error: true
+        uses: ./
+        with:
+          nexus-server: 'https://nexus.example.org'
+          nexus-username: 'test-user'
+          nexus-password: 'test-pass'
+          staging-profile-id: 'test-profile-id'
+          mode: 'invalid'
+
+      - name: 'Verify failure'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          if [ "${{ steps.invalid-mode.outcome }}" != "failure" ]; then
+            echo "::error::Expected failure for invalid" \
+              "mode, got: ${{ steps.invalid-mode.outcome }}"
+            exit 1
+          fi
+          echo "PASS: Invalid mode correctly rejected"
+
+  test-missing-m2repo:
+    name: 'Test: Missing m2repo fails'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 3
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@fe104658747b27e96e4f7e80cd0a94068e53901d  # v2.16.1
+        with:
+          egress-policy: 'audit'
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: 'Run action with missing m2repo (expect failure)'
+        id: missing-m2repo
+        continue-on-error: true
+        uses: ./
+        with:
+          nexus-server: 'https://nexus.example.org'
+          nexus-username: 'test-user'
+          nexus-password: 'test-pass'
+          staging-profile-id: 'test-profile-id'
+          mode: 'stage'
+          m2repo-path: 'nonexistent-directory'
+
+      - name: 'Verify failure'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          if [ "${{ steps.missing-m2repo.outcome }}" != "failure" ]; then
+            echo "::error::Expected failure for missing" \
+              "m2repo, got: ${{ steps.missing-m2repo.outcome }}"
+            exit 1
+          fi
+          echo "PASS: Missing m2repo correctly rejected"
+
+  test-missing-staging-repo-id:
+    name: 'Test: Missing staging-repo-id fails'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 3
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@fe104658747b27e96e4f7e80cd0a94068e53901d  # v2.16.1
+        with:
+          egress-policy: 'audit'
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: 'Run action with missing staging-repo-id (expect failure)'
+        id: missing-repo-id
+        continue-on-error: true
+        uses: ./
+        with:
+          nexus-server: 'https://nexus.example.org'
+          nexus-username: 'test-user'
+          nexus-password: 'test-pass'
+          staging-profile-id: 'test-profile-id'
+          mode: 'promote'
+          staging-repo-id: ''
+
+      - name: 'Verify failure'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          if [ "${{ steps.missing-repo-id.outcome }}" != "failure" ]; then
+            echo "::error::Expected failure for missing" \
+              "staging-repo-id," \
+              "got: ${{ steps.missing-repo-id.outcome }}"
+            exit 1
+          fi
+          echo "PASS: Missing staging-repo-id correctly rejected"
+
+  test-action-structure:
+    name: 'Test: Action structure valid'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 3
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@fe104658747b27e96e4f7e80cd0a94068e53901d  # v2.16.1
+        with:
+          egress-policy: 'audit'
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: 'Validate action.yaml structure'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+
+          echo "---> Validating action.yaml structure"
+
+          # Check action.yaml exists
+          if [ ! -f "action.yaml" ]; then
+            echo "::error::action.yaml not found"
+            exit 1
+          fi
+
+          # Verify required fields exist
+          for field in name description inputs outputs runs; do
+            if ! grep -q "^${field}:" action.yaml; then
+              echo "::error::Missing required field: ${field}"
+              exit 1
+            fi
+          done
+
+          # Verify required inputs
+          for input in nexus-server nexus-username nexus-password \
+              staging-profile-id mode; do
+            if ! grep -q "  ${input}:" action.yaml; then
+              echo "::error::Missing required input: ${input}"
+              exit 1
+            fi
+          done
+
+          # Verify outputs
+          for output in staging-repo-id staging-repo-url; do
+            if ! grep -q "  ${output}:" action.yaml; then
+              echo "::error::Missing required output: ${output}"
+              exit 1
+            fi
+          done
+
+          echo "PASS: Action structure validated"
