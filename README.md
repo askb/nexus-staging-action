@@ -13,7 +13,8 @@ dependency required.
 
 - **Stage**: Create staging repo, upload Maven artifacts, close for validation
 - **Close**: Close an existing staging repository
-- **Promote**: Release a closed staging repository to the releases repository
+- **Release**: Release a closed staging repository to the releases repository
+  (the `promote` mode name is a deprecated alias for `release`)
 - **Drop**: Drop/delete a staging repository (cleanup on failure)
 - Compatible with Nexus 2 staging API
 - Writes `staging-repo.txt` in JJB-compatible format
@@ -28,18 +29,28 @@ dependency required.
 | Create    | POST   | `/service/local/staging/profiles/{profile-id}/start`           |
 | Upload    | PUT    | `/service/local/staging/deployByRepositoryId/{repo-id}/{path}` |
 | Close     | POST   | `/service/local/staging/profiles/{profile-id}/finish`          |
-| Promote   | POST   | `/service/local/staging/profiles/{profile-id}/promote`         |
+| Verify    | GET    | `/service/local/staging/repository/{repo-id}/activity`         |
+| Release   | POST   | `/service/local/staging/bulk/promote`                          |
 | Drop      | POST   | `/service/local/staging/profiles/{profile-id}/drop`            |
 
 <!-- markdownlint-enable MD013 MD060 -->
 
-All API payloads use XML:
+Close and drop use XML payloads:
 
 ```xml
 <promoteRequest><data>
   <description>text</description>
   <stagedRepositoryId>repo-id</stagedRepositoryId>
 </data></promoteRequest>
+```
+
+Release matches `lftools nexus release`: it first verifies the repo
+is in a closed state (via the activity endpoint, failing on `ruleFailed` or
+`repositoryCloseFailed`), then releases via `bulk/promote` with a JSON payload,
+and polls the activity endpoint until `repositoryReleased`:
+
+```json
+{ "data": { "stagedRepositoryIds": ["repo-id"] } }
 ```
 
 ## Usage
@@ -60,17 +71,17 @@ All API payloads use XML:
     description: 'CI build ${{ github.run_id }}'
 ```
 
-### Promote Mode (Release)
+### Release Mode
 
 ```yaml
-- name: 'Promote staging repository'
+- name: 'Release staging repository'
   uses: askb/nexus-staging-action@main
   with:
     nexus-server: 'https://nexus.opendaylight.org'
     nexus-username: ${{ secrets.NEXUS_USERNAME }}
     nexus-password: ${{ secrets.NEXUS_PASSWORD }}
     staging-profile-id: ${{ vars.STAGING_PROFILE_ID }}
-    mode: 'promote'
+    mode: 'release'
     staging-repo-id: ${{ needs.stage.outputs.staging-repo-id }}
 ```
 
@@ -134,14 +145,14 @@ jobs:
     needs: stage
     runs-on: ubuntu-latest
     steps:
-      - name: 'Promote staging repo'
+      - name: 'Release staging repo'
         uses: askb/nexus-staging-action@main
         with:
           nexus-server: ${{ vars.NEXUS_SERVER }}
           nexus-username: ${{ secrets.NEXUS_USERNAME }}
           nexus-password: ${{ secrets.NEXUS_PASSWORD }}
           staging-profile-id: ${{ vars.STAGING_PROFILE_ID }}
-          mode: 'promote'
+          mode: 'release'
           staging-repo-id: ${{ needs.stage.outputs.staging-repo-id }}
 ```
 
@@ -155,9 +166,9 @@ jobs:
 | `nexus-username`     | Nexus username for authentication                               | ✅        | —                        |
 | `nexus-password`     | Nexus password for authentication                               | ✅        | —                        |
 | `staging-profile-id` | Nexus staging profile ID (per-project)                          | ✅        | —                        |
-| `mode`               | Operation mode: `stage`, `close`, `promote`, `drop`             | ✅        | `stage`                  |
+| `mode`               | Operation mode: `stage`, `close`, `release`, `drop`             | ✅        | `stage`                  |
 | `m2repo-path`        | Path to local Maven repo directory (for `stage` mode)           | ❌        | `m2repo`                 |
-| `staging-repo-id`    | Existing staging repo ID (for `close`/`promote`/`drop`)         | ❌        | —                        |
+| `staging-repo-id`    | Existing staging repo ID (for `close`/`release`/`drop`)         | ❌        | —                        |
 | `description`        | Description for the staging repository                          | ❌        | `GitHub Actions staging` |
 
 <!-- markdownlint-enable MD013 MD060 -->
@@ -186,12 +197,16 @@ jobs:
 4. Writes `archives/staging-repo.txt` in JJB-compatible format:
    `{repo-id} {repo-url}`
 
-### Promote Mode
+### Release Flow
 
-1. **Verify** — GET `/staging/repository/{repo-id}` to confirm the
-   staging repository exists
-2. **Promote** — POST to `/staging/profiles/{id}/promote` to release
-   artifacts to the releases repository
+Ports `lftools nexus release`:
+
+1. **Verify** — GET `/staging/repository/{repo-id}/activity` to confirm the
+   repository is in a closed state; fail on `ruleFailed` or
+   `repositoryCloseFailed`; skip if already `repositoryReleased`
+2. **Release** — POST to `/staging/bulk/promote` with the JSON payload
+   `{"data":{"stagedRepositoryIds":["repo-id"]}}` (expects HTTP 201)
+3. **Poll** — GET the activity endpoint until `repositoryReleased`
 
 ### Close Operation
 
@@ -212,7 +227,7 @@ jobs:
 | Runtime        | Python + pip                   | bash + curl           |
 | Install        | `pip install lftools`          | None (built-in)       |
 | Stage          | `lftools deploy nexus-stage`   | `mode: stage`         |
-| Release        | `lftools nexus release`        | `mode: promote`       |
+| Release        | `lftools nexus release`        | `mode: release`       |
 | Drop           | Manual API call                | `mode: drop`          |
 | CI Integration | Script wrapper                 | Native GitHub Action  |
 | Output format  | stdout parsing                 | GitHub Action outputs |

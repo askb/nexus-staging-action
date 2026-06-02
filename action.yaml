@@ -21,7 +21,7 @@ inputs:
     description: 'Nexus staging profile ID (per-project)'
     required: true
   mode:
-    description: 'Operation mode: stage, close, promote, drop'
+    description: 'Operation mode: stage, close, release, drop'
     required: true
     default: 'stage'
   m2repo-path:
@@ -29,9 +29,23 @@ inputs:
     required: false
     default: 'm2repo'
   staging-repo-id:
-    description: 'Existing staging repo ID (for close/promote/drop modes)'
+    description: 'Existing staging repo ID (for close/release/drop modes)'
     required: false
     default: ''
+  staging-repo-file:
+    description: >
+      Path to a staging-repo.txt file listing one or more staging repos
+      (one "REPO_ID REPO_URL" per line, as written by stage mode). When set,
+      close/release/drop operate on every repo in the file. Mirrors the JJB
+      behaviour of releasing all repos listed in staging-repo.txt.
+    required: false
+    default: ''
+  dry-run:
+    description: >
+      When 'true', verify the staging repo(s) exist but do NOT perform the
+      mutating operation (no close/release/drop). Mirrors JJB DRY_RUN.
+    required: false
+    default: 'false'
   description:
     description: 'Description for the staging repository'
     required: false
@@ -54,6 +68,8 @@ runs:
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_M2REPO_PATH: ${{ inputs.m2repo-path }}
         INPUT_STAGING_REPO_ID: ${{ inputs.staging-repo-id }}
+        INPUT_STAGING_REPO_FILE: ${{ inputs.staging-repo-file }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
       run: |
         # SPDX-License-Identifier: Apache-2.0
         set -euo pipefail
@@ -61,11 +77,22 @@ runs:
         echo "---> nexus-staging: Validating inputs"
 
         case "$INPUT_MODE" in
-          stage|close|promote|drop)
+          stage|close|release|drop)
+            ;;
+          promote)
+            echo "::warning::mode 'promote' is deprecated; use 'release'"
             ;;
           *)
             echo "::error::Invalid mode: $INPUT_MODE" \
-              "(must be: stage, close, promote, drop)"
+              "(must be: stage, close, release, drop)"
+            exit 1
+            ;;
+        esac
+
+        case "$INPUT_DRY_RUN" in
+          true|false) ;;
+          *)
+            echo "::error::Invalid dry-run: $INPUT_DRY_RUN (must be true/false)"
             exit 1
             ;;
         esac
@@ -83,9 +110,19 @@ runs:
           echo "INFO: Found $FILE_COUNT files in $INPUT_M2REPO_PATH"
         fi
 
-        if [ "$INPUT_MODE" != "stage" ] && [ -z "$INPUT_STAGING_REPO_ID" ]; then
-          echo "::error::staging-repo-id is required for mode: $INPUT_MODE"
-          exit 1
+        if [ "$INPUT_MODE" != "stage" ]; then
+          if [ -z "$INPUT_STAGING_REPO_ID" ] \
+              && [ -z "$INPUT_STAGING_REPO_FILE" ]; then
+            echo "::error::staging-repo-id or staging-repo-file is required" \
+              "for mode: $INPUT_MODE"
+            exit 1
+          fi
+          if [ -n "$INPUT_STAGING_REPO_FILE" ] \
+              && [ ! -f "$INPUT_STAGING_REPO_FILE" ]; then
+            echo "::error::staging-repo-file not found:" \
+              "$INPUT_STAGING_REPO_FILE"
+            exit 1
+          fi
         fi
 
     - name: 'Execute Nexus staging operation'
@@ -99,12 +136,19 @@ runs:
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_M2REPO_PATH: ${{ inputs.m2repo-path }}
         INPUT_STAGING_REPO_ID: ${{ inputs.staging-repo-id }}
+        INPUT_STAGING_REPO_FILE: ${{ inputs.staging-repo-file }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
         INPUT_DESCRIPTION: ${{ inputs.description }}
       run: |
         # SPDX-License-Identifier: Apache-2.0
         set -euo pipefail
 
         echo "---> nexus-staging: mode=$INPUT_MODE"
+
+        # Back-compat: 'promote' is the deprecated alias for 'release'
+        if [ "$INPUT_MODE" = "promote" ]; then
+          INPUT_MODE="release"
+        fi
 
         # Mask credentials
         echo "::add-mask::${INPUT_NEXUS_PASSWORD}"
@@ -113,6 +157,26 @@ runs:
         AUTH="${INPUT_NEXUS_USERNAME}:${INPUT_NEXUS_PASSWORD}"
         PROFILE_ID="${INPUT_STAGING_PROFILE_ID}"
         STAGING_API="${NEXUS_SERVER}/service/local/staging"
+
+        # Build list of staging repo IDs from explicit id and/or file.
+        # The file format matches stage-mode output: "REPO_ID REPO_URL".
+        build_repo_ids() {
+            REPO_IDS=()
+            if [ -n "${INPUT_STAGING_REPO_ID}" ]; then
+                REPO_IDS+=("${INPUT_STAGING_REPO_ID}")
+            fi
+            if [ -n "${INPUT_STAGING_REPO_FILE}" ]; then
+                while IFS= read -r line || [ -n "$line" ]; do
+                    # First whitespace-delimited field is the repo ID
+                    rid="$(echo "$line" | awk '{print $1}')"
+                    [ -n "$rid" ] && REPO_IDS+=("$rid")
+                done < "${INPUT_STAGING_REPO_FILE}"
+            fi
+            if [ "${#REPO_IDS[@]}" -eq 0 ]; then
+                echo "::error::No staging repo IDs resolved"
+                exit 1
+            fi
+        }
 
         # ─── STAGE MODE ────────────────────────────────────────
         if [ "$INPUT_MODE" = "stage" ]; then
@@ -212,99 +276,168 @@ runs:
                 echo "| **Upload Failures** | ${UPLOAD_FAIL} |"
             } >> "$GITHUB_STEP_SUMMARY"
 
-        # ─── PROMOTE MODE ──────────────────────────────────────
-        elif [ "$INPUT_MODE" = "promote" ]; then
-            echo "INFO: Promoting staging repository" \
-                "${INPUT_STAGING_REPO_ID}..."
+        # ─── RELEASE MODE (release closed repos) ──────────────────
+        # Ports `lftools nexus release` (nexus/cmd.py release_staging_repos):
+        # verify CLOSED state + rule failures, release via /staging/bulk/promote
+        # (JSON), then poll activity until the release completes.
+        elif [ "$INPUT_MODE" = "release" ]; then
 
-            # Verify staging repository exists
-            echo "INFO: Verifying staging repository..."
-            curl -sf -u "$AUTH" \
-                -H "Accept: application/xml" \
-                "${STAGING_API}/repository/${INPUT_STAGING_REPO_ID}" > /dev/null
+            build_repo_ids
+            echo "INFO: Release on ${#REPO_IDS[@]} repo(s)" \
+                "(dry-run=${INPUT_DRY_RUN})"
 
-            # Promote
-            PROMO_XML="<promoteRequest><data>"
-            PROMO_XML+="<stagedRepositoryId>"
-            PROMO_XML+="${INPUT_STAGING_REPO_ID}"
-            PROMO_XML+="</stagedRepositoryId>"
-            PROMO_XML+="<description>"
-            PROMO_XML+="Promote: ${INPUT_DESCRIPTION}"
-            PROMO_XML+="</description>"
-            PROMO_XML+="</data></promoteRequest>"
-            curl -sf -u "$AUTH" \
-                -H "Content-Type: application/xml" \
-                -d "$PROMO_XML" \
-                "${STAGING_API}/profiles/${PROFILE_ID}/promote"
+            LAST_REPO_ID=""
+            SUMMARY_ROWS=""
+            for RID in "${REPO_IDS[@]}"; do
+                ACTIVITY_URL="${STAGING_API}/repository/${RID}/activity"
 
-            echo "INFO: Staging repository" \
-                "${INPUT_STAGING_REPO_ID} promoted"
+                # Verify repo state before releasing (lftools parity)
+                echo "INFO: Verifying staging repository ${RID}..."
+                if ! ACTIVITY=$(curl -sf -u "$AUTH" \
+                    -H "Accept: application/xml" "$ACTIVITY_URL"); then
+                    echo "::error::Verification of ${RID} failed (activity)"
+                    exit 1
+                fi
 
-            REPO_URL="${NEXUS_SERVER}/content/repositories"
-            REPO_URL+="/${INPUT_STAGING_REPO_ID}"
-            echo "staging-repo-id=${INPUT_STAGING_REPO_ID}" \
-                >> "$GITHUB_OUTPUT"
-            echo "staging-repo-url=${REPO_URL}" \
-                >> "$GITHUB_OUTPUT"
+                if echo "$ACTIVITY" | grep -q "ruleFailed" \
+                    || echo "$ACTIVITY" | grep -q "repositoryCloseFailed"; then
+                    echo "::error::One or more staging rules failed for ${RID}"
+                    exit 1
+                fi
+
+                if echo "$ACTIVITY" | grep -q "repositoryReleased"; then
+                    echo "INFO: Repository ${RID} already released; skipping"
+                    SUMMARY_ROWS+="| \`${RID}\` | already released |"$'\n'
+                    LAST_REPO_ID="${RID}"
+                    continue
+                fi
+
+                if ! echo "$ACTIVITY" | grep -q "repositoryClosed"; then
+                    echo "::error::Repository ${RID} is not in closed state"
+                    exit 1
+                fi
+                echo "INFO: PASS: Repository ${RID} is in closed state"
+
+                if [ "$INPUT_DRY_RUN" = "true" ]; then
+                    echo "INFO: [dry-run] would release ${RID} (skipped)"
+                    SUMMARY_ROWS+="| \`${RID}\` | verified (dry-run) |"$'\n'
+                    LAST_REPO_ID="${RID}"
+                    continue
+                fi
+
+                # Release via bulk/promote (matches lftools nexus release)
+                echo "INFO: Releasing ${RID} via /staging/bulk/promote..."
+                RELEASE_JSON="{\"data\":{\"stagedRepositoryIds\":[\"${RID}\"]}}"
+                HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+                    -u "$AUTH" \
+                    -H "Content-Type: application/json" \
+                    -d "$RELEASE_JSON" \
+                    "${STAGING_API}/bulk/promote")
+                if [ "$HTTP_CODE" != "201" ]; then
+                    echo "::error::Release of ${RID} failed (HTTP ${HTTP_CODE})"
+                    exit 1
+                fi
+                echo "INFO: Nexus is now releasing ${RID}"
+
+                # Poll activity until the release completes
+                sleep 5
+                WAIT_SECONDS=20
+                WAIT_ITER=0
+                MAX_ITER=90
+                while true; do
+                    POLL=$(curl -sf -u "$AUTH" \
+                        -H "Accept: application/xml" "$ACTIVITY_URL" || true)
+                    if echo "$POLL" | grep -q "repositoryReleased"; then
+                        echo "INFO: Repository ${RID} released"
+                        break
+                    fi
+                    WAIT_ITER=$((WAIT_ITER + 1))
+                    if [ "$WAIT_ITER" -ge "$MAX_ITER" ]; then
+                        echo "::error::Timed out waiting for ${RID} to release"
+                        exit 1
+                    fi
+                    sleep "$WAIT_SECONDS"
+                    ELAPSED=$((WAIT_SECONDS * WAIT_ITER))
+                    echo "INFO: Still waiting... ${ELAPSED}s gone"
+                done
+
+                SUMMARY_ROWS+="| \`${RID}\` | released |"$'\n'
+                LAST_REPO_ID="${RID}"
+            done
+
+            REPO_URL="${NEXUS_SERVER}/content/repositories/${LAST_REPO_ID}"
+            echo "staging-repo-id=${LAST_REPO_ID}" >> "$GITHUB_OUTPUT"
+            echo "staging-repo-url=${REPO_URL}" >> "$GITHUB_OUTPUT"
 
             {
-                echo "## Nexus Staging Promoted ✅"
+                echo "## Nexus Staging Release ✅"
                 echo ""
-                echo "| | |"
+                echo "| Repo ID | Result |"
                 echo "|---|---|"
-                echo "| **Mode** | promote |"
-                echo "| **Repo ID** | \`${INPUT_STAGING_REPO_ID}\` |"
+                printf '%s' "${SUMMARY_ROWS}"
+                echo ""
+                echo "_dry-run: ${INPUT_DRY_RUN}_"
             } >> "$GITHUB_STEP_SUMMARY"
 
-        # ─── CLOSE MODE ────────────────────────────────────
-        elif [ "$INPUT_MODE" = "close" ]; then
-            echo "INFO: Closing staging repository" \
-                "${INPUT_STAGING_REPO_ID}..."
+        # ─── CLOSE / DROP MODES (loop over repo list) ──────────────
+        elif [ "$INPUT_MODE" = "close" ] || [ "$INPUT_MODE" = "drop" ]; then
 
-            CLOSE_XML="<promoteRequest><data>"
-            CLOSE_XML+="<stagedRepositoryId>"
-            CLOSE_XML+="${INPUT_STAGING_REPO_ID}"
-            CLOSE_XML+="</stagedRepositoryId>"
-            CLOSE_XML+="<description>"
-            CLOSE_XML+="Close: ${INPUT_DESCRIPTION}"
-            CLOSE_XML+="</description>"
-            CLOSE_XML+="</data></promoteRequest>"
-            curl -sf -u "$AUTH" \
-                -H "Content-Type: application/xml" \
-                -d "$CLOSE_XML" \
-                "${STAGING_API}/profiles/${PROFILE_ID}/finish"
+            build_repo_ids
 
-            echo "INFO: Staging repository" \
-                "${INPUT_STAGING_REPO_ID} closed"
+            case "$INPUT_MODE" in
+                close) ACTION_VERB="Close"; API_OP="finish" ;;
+                drop)  ACTION_VERB="Drop";  API_OP="drop"   ;;
+            esac
 
-            REPO_URL="${NEXUS_SERVER}/content/repositories"
-            REPO_URL+="/${INPUT_STAGING_REPO_ID}"
-            echo "staging-repo-id=${INPUT_STAGING_REPO_ID}" \
-                >> "$GITHUB_OUTPUT"
-            echo "staging-repo-url=${REPO_URL}" \
-                >> "$GITHUB_OUTPUT"
+            echo "INFO: ${ACTION_VERB} on ${#REPO_IDS[@]} repo(s)" \
+                "(dry-run=${INPUT_DRY_RUN})"
 
-        # ─── DROP MODE ─────────────────────────────────────
-        elif [ "$INPUT_MODE" = "drop" ]; then
-            echo "INFO: Dropping staging repository" \
-                "${INPUT_STAGING_REPO_ID}..."
+            LAST_REPO_ID=""
+            SUMMARY_ROWS=""
+            for RID in "${REPO_IDS[@]}"; do
+                echo "INFO: Verifying staging repository ${RID}..."
+                if ! curl -sf -u "$AUTH" \
+                    -H "Accept: application/xml" \
+                    "${STAGING_API}/repository/${RID}" > /dev/null; then
+                    echo "::error::Staging repository not found: ${RID}"
+                    exit 1
+                fi
 
-            DROP_XML="<promoteRequest><data>"
-            DROP_XML+="<stagedRepositoryId>"
-            DROP_XML+="${INPUT_STAGING_REPO_ID}"
-            DROP_XML+="</stagedRepositoryId>"
-            DROP_XML+="<description>"
-            DROP_XML+="Drop: ${INPUT_DESCRIPTION}"
-            DROP_XML+="</description>"
-            DROP_XML+="</data></promoteRequest>"
-            curl -sf -u "$AUTH" \
-                -H "Content-Type: application/xml" \
-                -d "$DROP_XML" \
-                "${STAGING_API}/profiles/${PROFILE_ID}/drop"
+                if [ "$INPUT_DRY_RUN" = "true" ]; then
+                    echo "INFO: [dry-run] would ${API_OP} ${RID} (skipped)"
+                    SUMMARY_ROWS+="| \`${RID}\` | verified (dry-run) |"$'\n'
+                else
+                    OP_XML="<promoteRequest><data>"
+                    OP_XML+="<stagedRepositoryId>${RID}</stagedRepositoryId>"
+                    OP_XML+="<description>"
+                    OP_XML+="${ACTION_VERB}: ${INPUT_DESCRIPTION}"
+                    OP_XML+="</description>"
+                    OP_XML+="</data></promoteRequest>"
+                    curl -sf -u "$AUTH" \
+                        -H "Content-Type: application/xml" \
+                        -d "$OP_XML" \
+                        "${STAGING_API}/profiles/${PROFILE_ID}/${API_OP}"
+                    echo "INFO: Staging repository ${RID} ${API_OP}d"
+                    SUMMARY_ROWS+="| \`${RID}\` | ${API_OP}d |"$'\n'
+                fi
+                LAST_REPO_ID="${RID}"
+            done
 
-            echo "INFO: Staging repository" \
-                "${INPUT_STAGING_REPO_ID} dropped"
-            echo "staging-repo-id=${INPUT_STAGING_REPO_ID}" \
-                >> "$GITHUB_OUTPUT"
-            echo "staging-repo-url=" >> "$GITHUB_OUTPUT"
+            if [ "$INPUT_MODE" = "drop" ]; then
+                REPO_URL=""
+            else
+                REPO_URL="${NEXUS_SERVER}/content/repositories/${LAST_REPO_ID}"
+            fi
+            echo "staging-repo-id=${LAST_REPO_ID}" >> "$GITHUB_OUTPUT"
+            echo "staging-repo-url=${REPO_URL}" >> "$GITHUB_OUTPUT"
+
+            {
+                echo "## Nexus Staging ${ACTION_VERB} ✅"
+                echo ""
+                echo "| Repo ID | Result |"
+                echo "|---|---|"
+                printf '%s' "${SUMMARY_ROWS}"
+                echo ""
+                echo "_dry-run: ${INPUT_DRY_RUN}_"
+            } >> "$GITHUB_STEP_SUMMARY"
         fi
