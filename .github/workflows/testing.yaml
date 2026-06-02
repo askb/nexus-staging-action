@@ -129,6 +129,8 @@ jobs:
           nexus-username: 'test-user'
           nexus-password: 'test-pass'
           staging-profile-id: 'test-profile-id'
+          # 'promote' is the deprecated alias for 'release'; this also
+          # exercises that the alias still routes to the release validation.
           mode: 'promote'
           staging-repo-id: ''
 
@@ -200,3 +202,96 @@ jobs:
           done
 
           echo "PASS: Action structure validated"
+
+  ### Mocked release flow (no live Nexus required) ###
+  test-release-mock:
+    name: 'Test: Release flow against mock Nexus'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    env:
+      MOCK_LOG: '/tmp/nexus_requests.log'
+      MOCK_PORT: '8089'
+      MOCK_REPO_ID: 'mock-repo-1001'
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@fe104658747b27e96e4f7e80cd0a94068e53901d  # v2.16.1
+        with:
+          egress-policy: 'audit'
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: 'Start mock Nexus server'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+          python3 tests/mock_nexus.py > /tmp/mock.out 2>&1 &
+          # Wait for the server to accept connections
+          BASE="http://127.0.0.1:${MOCK_PORT}/service/local/staging"
+          ACT="${BASE}/repository/${MOCK_REPO_ID}/activity"
+          for _ in $(seq 1 20); do
+            if curl -sf "${ACT}" > /dev/null 2>&1; then
+              echo "INFO: mock-nexus is up"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::mock-nexus did not start"
+          cat /tmp/mock.out || true
+          exit 1
+
+      - name: 'Run action in release mode against mock'
+        id: release
+        uses: ./
+        with:
+          nexus-server: 'http://127.0.0.1:8089'
+          nexus-username: 'mock-user'
+          nexus-password: 'mock-pass'
+          staging-profile-id: 'mock-profile'
+          mode: 'release'
+          staging-repo-id: 'mock-repo-1001'
+
+      - name: 'Assert request flow'
+        shell: bash
+        run: |
+          # SPDX-License-Identifier: Apache-2.0
+          set -euo pipefail
+
+          echo "---> Recorded requests:"
+          cat "${MOCK_LOG}"
+
+          # 1. The action must release via the bulk/promote endpoint with the
+          #    exact JSON payload lftools uses (NOT /profiles/{id}/promote).
+          if ! grep -q "POST /service/local/staging/bulk/promote BODY" \
+              "${MOCK_LOG}"; then
+            echo "::error::release did not POST to /staging/bulk/promote"
+            exit 1
+          fi
+          if ! grep -q '{"data":{"stagedRepositoryIds":\["mock-repo-1001"\]}}' \
+              "${MOCK_LOG}"; then
+            echo "::error::bulk/promote payload mismatch"
+            exit 1
+          fi
+          if grep -q "/profiles/.*/promote" "${MOCK_LOG}"; then
+            echo "::error::wrong endpoint /profiles/{id}/promote used"
+            exit 1
+          fi
+
+          # 2. It must verify state (activity) before AND poll after release.
+          ACTIVITY_HITS=$(grep -c "GET .*/activity" "${MOCK_LOG}")
+          if [ "${ACTIVITY_HITS}" -lt 2 ]; then
+            echo "::error::expected verify + poll on activity," \
+              "saw ${ACTIVITY_HITS}"
+            exit 1
+          fi
+
+          # 3. The action step itself must have succeeded.
+          if [ "${{ steps.release.outcome }}" != "success" ]; then
+            echo "::error::release step failed"
+            exit 1
+          fi
+
+          echo "PASS: release flow matches lftools nexus release"
