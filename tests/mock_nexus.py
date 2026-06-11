@@ -43,7 +43,7 @@ RELEASED_XML = (
 
 def _log(line: str) -> None:
     with open(LOG, "a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
+        _ = handle.write(line + "\n")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -55,7 +55,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        _ = self.wfile.write(payload)
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         _log("GET {}".format(self.path))
@@ -71,8 +71,8 @@ class Handler(BaseHTTPRequestHandler):
         _log("POST {} BODY {}".format(self.path, body))
         if self.path.endswith("/staging/bulk/promote"):
             try:
-                data = json.loads(body)
-                ids = data["data"]["stagedRepositoryIds"]
+                data = json.loads(body)  # pyright: ignore[reportAny]
+                ids = data["data"]["stagedRepositoryIds"]  # pyright: ignore[reportAny]
             except (ValueError, KeyError):
                 self._send(400, "<error/>", "application/xml")
                 return
@@ -84,7 +84,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "<error/>", "application/xml")
 
-    def log_message(self, *_args) -> None:  # silence default logging
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002  # pyright: ignore[reportImplicitOverride]
         return
 
 
